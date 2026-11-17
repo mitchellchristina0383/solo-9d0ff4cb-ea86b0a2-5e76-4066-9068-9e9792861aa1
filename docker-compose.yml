@@ -1,0 +1,41 @@
+services:
+  upstream1:
+    build:
+      context: ./upstream
+    environment:
+      NODE_ID: node1
+    ports:
+      - "18081:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  upstream2:
+    build:
+      context: ./upstream
+    environment:
+      NODE_ID: node2
+    ports:
+      - "18082:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/', timeout=2).status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  gateway:
+    build:
+      context: ./gateway
+    environment:
+      UPSTREAMS: "node1=http://upstream1:8000,node2=http://upstream2:8000"
+      PROBE_INTERVAL: "2"
+      PROBE_TIMEOUT: "1.5"
+      REQUEST_TIMEOUT: "15"
+      DRAIN_DEFAULT_TIMEOUT: "30"
+    ports:
+      - "18080:8000"
+    depends_on:
+      - upstream1
+      - upstream2
