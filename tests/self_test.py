@@ -15,9 +15,21 @@
   11. /docs 可打开
   12. 排空等待超时 -> 202，在途数准确
   13. 上游挂起 -> 网关请求超时 504，不虚报成功、在途归零
+  14. 多并发在途请求：排空须等全部结束，在途计数全程准确
+  15. 未知节点管理接口返回 404
+  16. 会话开立与绑定查询（凭据不可伪造、只进原实例）
+  17. 普通 GET 仍轮询，绑定 GET 固定节点（互不影响）
+  18. 绑定节点排空 -> 503 保留绑定、绝不改投；恢复后同凭据继续
+  19. 绑定节点故障 -> 503 保留绑定；恢复后同凭据继续
+  20. 网关重启（上游未重启）-> 旧凭据仍可用
+  21. 上游进程重启 -> 旧凭据明确失效 410，不误接同名新实例
+  22. 全部不可接流时会话开立 -> 503；新会话只选可接流节点
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import os
 import signal
@@ -50,9 +62,10 @@ def check(name: str, cond: bool, detail: str = "") -> None:
         print(f"  [FAIL] {name} {detail}")
 
 
-def http(method: str, url: str, timeout: float = 20.0, data: bytes | None = None):
+def http(method: str, url: str, timeout: float = 20.0, data: bytes | None = None,
+         headers: dict | None = None):
     """返回 (status, headers, body_text)。4xx/5xx 不抛异常。"""
-    req = urllib.request.Request(url, method=method, data=data)
+    req = urllib.request.Request(url, method=method, data=data, headers=headers or {})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return resp.status, dict(resp.headers), resp.read().decode()
@@ -63,6 +76,16 @@ def http(method: str, url: str, timeout: float = 20.0, data: bytes | None = None
 def jget(url: str, timeout: float = 20.0):
     status, _, body = http("GET", url, timeout)
     return status, json.loads(body)
+
+
+def mint_local_token(node: str, instance_id: str, sid: str, secret: str) -> str:
+    """用与网关相同的算法在测试侧签发凭据（用于构造绑定未知节点等用例）。"""
+    payload = {"v": 1, "node": node, "instance": instance_id, "sid": sid,
+               "iat": int(time.time())}
+    payload_b = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    sig = hmac.new(secret.encode(), payload_b, hashlib.sha256).digest()
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    return f"{b64(payload_b)}.{b64(sig)}"
 
 
 def wait_ready(url: str, timeout: float = 25.0) -> bool:
@@ -136,6 +159,8 @@ def main() -> int:
             "PROBE_TIMEOUT": "1",
             "REQUEST_TIMEOUT": "15",
             "DRAIN_DEFAULT_TIMEOUT": "10",
+            # 固定密钥：网关重启场景（场景 20）要求旧凭据在新网关进程仍可验证
+            "SESSION_SECRET": "self-test-fixed-secret-0123456789abcdef",
         }
         gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, gw_env)
         procs.append(gw)
@@ -408,12 +433,253 @@ def main() -> int:
               str(results14))
         check("全部结束后在途归零", node_status("node1")["inflight"] == 0)
 
-        # 15. 未知节点管理接口返回 404
-        print("== 15. 未知节点 404 ==")
+        # 16. 会话开立与绑定查询：不可伪造、只进原实例
+        print("== 16. 会话开立与绑定查询 ==")
+        # 前置：场景 14 留下了排空状态，先把两节点恢复到可接流
+        for n in ("node1", "node2"):
+            if not node_status(n)["eligible"]:
+                status, _, _ = http(
+                    "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/{n}/resume")
+                assert status == 200
+        deadline = time.time() + 10
+        while time.time() < deadline and not all(
+                node_status(n)["eligible"] for n in ("node1", "node2")):
+            time.sleep(0.2)
+        check("前置：两节点均可接流",
+              all(node_status(n)["eligible"] for n in ("node1", "node2")))
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/session/open")
+        check("开立会话返回 201", status == 201, body)
+        token = body["token"]
+        bound_node = body["node"]
+        bound_instance = body["instance_id"]
+        sid = body["session_id"]
+        check("返回 token / 节点 / 实例 / 会话号",
+              bool(token) and bound_node in ("node1", "node2") and len(bound_instance) > 8 and len(sid) > 8,
+              str(body))
+        # 上游侧确实建立了进程内会话
+        up_port = U1_PORT if bound_node == "node1" else U2_PORT
+        status, cstate = jget(f"http://127.0.0.1:{up_port}/control/state")
+        check("上游进程内会话数增加", status == 200 and cstate["sessions"] >= 1, str(cstate))
+        check("上游 instance_id 与凭据一致", cstate["instance_id"] == bound_instance, str(cstate))
+
+        hdr = {"X-Session-Token": token}
+        status, body = (lambda r: (r[0], json.loads(r[2])))(
+            http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+                 headers=hdr))
+        check("绑定查询 200 且落在原节点原实例",
+              status == 200 and body["node"] == bound_node
+              and body["instance_id"] == bound_instance and body["queries"] == 1,
+              str(body))
+        # 再来一次：查询计数累加，节点/实例不变
+        status, body = (lambda r: (r[0], json.loads(r[2])))(
+            http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+                 headers=hdr))
+        check("第二次绑定查询计数累加且仍固定原节点",
+              status == 200 and body["queries"] == 2 and body["node"] == bound_node, str(body))
+        # 查询参数方式同样生效
+        status, body = jget(
+            f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}&session_token={token}")
+        check("查询参数携带凭据同样绑定", status == 200 and body["node"] == bound_node, str(body))
+        # 伪造/篡改/畸形凭据一律拒绝
+        forged = token[:-2] + ("aa" if token[-2:] != "aa" else "bb")
+        status, _, body = http(
+            "GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo",
+            headers={"X-Session-Token": forged})
+        check("篡改签名的凭据返回 401", status == 401, body)
+        status, _, body = http(
+            "GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo",
+            headers={"X-Session-Token": "not-a-token"})
+        check("畸形凭据返回 401", status == 401, body)
+        # 管理面可见会话统计与实例身份
+        st = node_status(bound_node)
+        check("状态面展示 instance_id 与开立/绑定计数",
+              st["instance_id"] == bound_instance and st["session_opened"] >= 1
+              and st["session_bound_hits"] >= 3, str(st))
+
+        # 17. 普通 GET 继续轮询；绑定 GET 始终固定，互不影响
+        print("== 17. 轮询与绑定互不影响 ==")
+        seen = []
+        for _ in range(4):
+            status, b = jget(f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+            assert status == 200
+            seen.append(b["node"])
+        check("普通 GET 仍在两节点间轮询", len(set(seen)) == 2, str(seen))
+        bound_seen = set()
+        for _ in range(4):
+            status, b = (lambda r: (r[0], json.loads(r[2])))(
+                http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+                     headers=hdr))
+            assert status == 200, b
+            bound_seen.add(b["node"])
+        check("绑定 GET 始终固定在原节点", bound_seen == {bound_node}, str(bound_seen))
+
+        # 18. 绑定节点排空 -> 503 保留绑定、绝不改投；恢复后同凭据继续
+        print("== 18. 排空期间绑定查询 503 且不改投 ==")
+        other_node = "node2" if bound_node == "node1" else "node1"
+        status, _, _ = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/{bound_node}/drain?timeout=5")
+        assert status == 200
+        status, _, body = http(
+            "GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+            headers=hdr)
+        b18 = json.loads(body)
+        check("绑定节点排空时返回 503", status == 503, body)
+        check("503 原因为 node_draining 且保留绑定提示",
+              b18.get("error") == "node_draining" and b18.get("node") == bound_node, body)
+        check("绝不改投另一节点（响应里没有对端节点信息）", "instance_id" not in b18, body)
+        st = node_status(bound_node)
+        check("被拒绑定计入 session_rejected", st["session_rejected"] >= 1, str(st))
+        # 同节点上的普通轮询也不会选中它；另一节点仍可服务普通流量
+        status, b = jget(f"http://127.0.0.1:{GW_PORT}/proxy/echo")
+        check("普通流量只去未排空的另一节点", status == 200 and b["node"] == other_node, str(b))
+        # 恢复后凭同一凭据继续查询
+        status, _, _ = http(
+            "POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/{bound_node}/resume")
+        assert status == 200
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status(bound_node)["eligible"]:
+            time.sleep(0.2)
+        check("恢复后绑定节点重新可接流", node_status(bound_node)["eligible"] is True)
+        status, b = (lambda r: (r[0], json.loads(r[2])))(
+            http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+                 headers=hdr))
+        check("同一凭据恢复后继续查询成功且仍是原实例",
+              status == 200 and b["node"] == bound_node
+              and b["instance_id"] == bound_instance, str(b))
+
+        # 19. 绑定节点探测故障 -> 503 保留绑定；恢复后同凭据继续
+        print("== 19. 故障期间绑定查询 503 且不改投 ==")
+        set_mode(up_port, "error")
+        deadline = time.time() + 8
+        while time.time() < deadline and node_status(bound_node)["healthy"]:
+            time.sleep(0.2)
+        check("探测已将绑定节点标记不健康", node_status(bound_node)["healthy"] is False)
+        status, _, body = http(
+            "GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+            headers=hdr)
+        b19 = json.loads(body)
+        check("故障期间绑定查询返回 503 而非改投",
+              status == 503 and b19.get("error") == "node_unhealthy"
+              and b19.get("node") == bound_node, body)
+        set_mode(up_port, "healthy")
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status(bound_node)["eligible"]:
+            time.sleep(0.2)
+        status, b = (lambda r: (r[0], json.loads(r[2])))(
+            http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+                 headers=hdr))
+        check("故障恢复后同一凭据继续可用、仍是原实例",
+              status == 200 and b["instance_id"] == bound_instance, str(b))
+
+        # 20. 网关重启（上游未重启）：旧凭据仍可使用
+        print("== 20. 网关重启后旧凭据仍有效 ==")
+        kill(gw)
+        procs.remove(gw)
+        gw = spawn(os.path.join(ROOT, "gateway"), GW_PORT, gw_env)
+        procs.append(gw)
+        assert wait_ready(f"http://127.0.0.1:{GW_PORT}/docs")
+        time.sleep(1.5)  # 等首轮探测完成实例身份发现
+        status, b = (lambda r: (r[0], json.loads(r[2])))(
+            http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+                 headers=hdr))
+        check("网关重启后旧凭据查询成功", status == 200, str(b))
+        check("仍路由到原节点原实例（会话未丢）",
+              b.get("node") == bound_node and b.get("instance_id") == bound_instance, str(b))
+        check("会话查询计数在上游侧持续累加（进程内会话仍在）", b.get("queries", 0) >= 5, str(b))
+
+        # 21. 上游进程重启：旧凭据明确失效 410，不误接同名新实例
+        print("== 21. 上游进程重启 -> 旧凭据 410 失效 ==")
+        if bound_node == "node1":
+            kill(u1)
+            procs.remove(u1)
+            u1 = spawn(os.path.join(ROOT, "upstream"), U1_PORT, {"NODE_ID": "node1"})
+            procs.insert(0, u1)
+            assert wait_ready(f"http://127.0.0.1:{U1_PORT}/")
+        else:
+            kill(u2)
+            procs.remove(u2)
+            u2 = spawn(os.path.join(ROOT, "upstream"), U2_PORT, {"NODE_ID": "node2"})
+            procs.insert(1, u2)
+            assert wait_ready(f"http://127.0.0.1:{U2_PORT}/")
+        # 等网关探测发现新 instance_id
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            st = node_status(bound_node)
+            if st["instance_id"] and st["instance_id"] != bound_instance and st["eligible"]:
+                break
+            time.sleep(0.2)
+        st = node_status(bound_node)
+        check("网关发现同名节点的新实例身份",
+              st["instance_id"] and st["instance_id"] != bound_instance and st["eligible"],
+              str(st))
+        status, _, body = http(
+            "GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+            headers=hdr)
+        b21 = json.loads(body)
+        check("旧凭据明确失效返回 410", status == 410, body)
+        check("410 同时给出旧/新实例号，证明未误接同名新实例",
+              b21.get("error") == "session_bound_instance_gone"
+              and b21.get("bound_instance_id") == bound_instance
+              and b21.get("current_instance_id") == st["instance_id"], body)
+        # 新实例上查旧 sid：即使绕过网关也不存在（进程内存已清空）
+        status, body = jget(f"http://127.0.0.1:{up_port}/session/query?sid={sid}")
+        check("新进程内旧会话不存在（上游直连 404）", status == 404, str(body))
+        # 重新开立会话：新凭据绑定当前可接流节点的真实实例（轮询可能选中任一节点）
+        open_status, open_body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/session/open")
+        new_open_node = open_body["node"]
+        st_new = node_status(new_open_node)
+        check("重启后可开立新会话且绑定所选节点的真实实例",
+              open_status == 201
+              and open_body["instance_id"] == st_new["instance_id"]
+              and open_body["instance_id"] != bound_instance, str(open_body))
+        new_token = open_body["token"]
+        new_sid = open_body["session_id"]
+        status, b = (lambda r: (r[0], json.loads(r[2])))(
+            http("GET",
+                 f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={new_sid}",
+                 headers={"X-Session-Token": new_token}))
+        check("新凭据在新实例上查询成功", status == 200 and b["queries"] == 1, str(b))
+        # 旧凭据不会因为新会话开立而复活
+        status, _, body = http(
+            "GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/query?sid={sid}",
+            headers=hdr)
+        check("旧凭据仍然 410", status == 410, body)
+
+        # 22. 无可用节点时会话开立 -> 503；新会话只选可接流节点
+        print("== 22. 会话开立只选可接流节点 ==")
+        http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/drain?timeout=5")
+        http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/drain?timeout=5")
+        status, _, body = http("GET", f"http://127.0.0.1:{GW_PORT}/proxy/session/open")
+        b22 = json.loads(body)
+        check("全部排空时开立会话返回 503", status == 503, body)
+        check("503 原因可解释", b22.get("error") == "no_eligible_upstream", body)
+        # 恢复 node2 后开立，新会话必须落在 node2
+        status, _, _ = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node2/resume")
+        assert status == 200
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node2")["eligible"]:
+            time.sleep(0.2)
+        status, body = jget(f"http://127.0.0.1:{GW_PORT}/proxy/session/open")
+        check("部分可接流时新会话只落在可接流节点",
+              status == 201 and body["node"] == "node2", str(body))
+        http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/node1/resume")
+        deadline = time.time() + 8
+        while time.time() < deadline and not node_status("node1")["eligible"]:
+            time.sleep(0.2)
+
+        # 23. 未知节点管理接口返回 404
+        print("== 23. 未知节点 404 ==")
         status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/drain")
         check("排空未知节点返回 404", status == 404, body)
         status, _, body = http("POST", f"http://127.0.0.1:{GW_PORT}/admin/nodes/ghost/resume")
         check("恢复未知节点返回 404", status == 404, body)
+        # 凭据绑定未知节点名 -> 404（而非轮询转发）
+        mystery = mint_local_token("ghost", bound_instance, sid,
+                                   "self-test-fixed-secret-0123456789abcdef")
+        status, _, body = http(
+            "GET", f"http://127.0.0.1:{GW_PORT}/proxy/echo",
+            headers={"X-Session-Token": mystery})
+        check("绑定未知节点的凭据返回 404", status == 404, body)
 
         print(f"\n==== 结果: {passed} passed, {failed} failed ====")
         return 1 if failed else 0

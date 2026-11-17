@@ -34,6 +34,8 @@ services:
       PROBE_TIMEOUT: "1.5"
       REQUEST_TIMEOUT: "15"
       DRAIN_DEFAULT_TIMEOUT: "30"
+      # 固定 HMAC 密钥：网关滚动重启后，上游未重启时旧会话凭据仍可验证使用
+      SESSION_SECRET: "demo-session-secret-change-in-production-0123456789"
     ports:
       - "18080:8000"
     depends_on:
